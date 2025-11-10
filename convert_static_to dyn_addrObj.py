@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Panorama (strict, no-commit) tagging script with CSV audit logging.
+Panorama (strict, no-commit) tagging script with logging, rate limiting, and CSV audit logging.
 
-✅ What it does:
+What it does:
   - Expands nested STATIC Address Groups recursively (cycle-protected).
   - Tags all Address Objects (Shared + DG) that belong to the target group.
   - Skips dynamic groups, missing members, or objects that already have the tag.
-  - Writes detailed results to both console and CSV file for audit tracking.
+  - Throttles API writes using rate limiting and batch pauses.
+  - Logs detailed actions (INFO/WARNING/ERROR) to console and log file.
+  - Writes CSV audit file with per-object outcomes.
 
-🧾 CSV Report Fields:
-  object | scope | status | reason | tag_name | target_group | target_scope | timestamp
-
-⚙️ Requirements:
+Requirements:
   pip install pan-os-python pandas
 """
 
 import sys
+import time
 import getpass
+import logging
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Set, Dict, Tuple, Union, List
@@ -25,7 +26,6 @@ from typing import Optional, Set, Dict, Tuple, Union, List
 from panos.panorama import Panorama, DeviceGroup
 from panos.objects import AddressObject, AddressGroup, Tag
 from panos.errors import PanDeviceError
-
 
 # -------------------------
 # 🔧 User input (strict)
@@ -54,22 +54,99 @@ DYNAMIC_MATCH_TAG = input("Tag to apply to Address Objects: ").strip()
 if not DYNAMIC_MATCH_TAG:
     sys.exit("❌ ERROR: Tag name cannot be blank.")
 
+# Rate limiting inputs
+try:
+    MAX_RPS = float(input("Max write operations per second (e.g., 2): ").strip())
+    if MAX_RPS <= 0:
+        raise ValueError
+except ValueError:
+    sys.exit("❌ ERROR: Max write operations per second must be a positive number.")
+
+try:
+    BATCH_SIZE = int(input("Batch size before pausing (e.g., 20): ").strip())
+    if BATCH_SIZE <= 0:
+        raise ValueError
+except ValueError:
+    sys.exit("❌ ERROR: Batch size must be a positive integer.")
+
+try:
+    BATCH_PAUSE_SEC = float(input("Batch pause duration in seconds (e.g., 5): ").strip())
+    if BATCH_PAUSE_SEC < 0:
+        raise ValueError
+except ValueError:
+    sys.exit("❌ ERROR: Batch pause duration must be non-negative.")
+
+LOG_FILE = input("Optional log file path (press Enter to skip): ").strip()
 
 # -------------------------
-# Helper functions
+# 🧾 Logging Configuration
+# -------------------------
+log_level = logging.INFO
+logger = logging.getLogger("PanoramaTagger")
+logger.setLevel(log_level)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(log_level)
+console_formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%H:%M:%S")
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# Optional file handler
+if LOG_FILE:
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setLevel(log_level)
+    file_formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    logger.info(f"Logging to file: {LOG_FILE}")
+
+# -------------------------
+# ⏱️ Rate Limiter
+# -------------------------
+class RateLimiter:
+    """Simple wall-clock rate limiter with batch pauses."""
+    def __init__(self, rps: float, batch_size: int, batch_pause: float):
+        self.min_interval = 1.0 / rps
+        self.last_ts = 0.0
+        self.batch_size = batch_size
+        self.batch_pause = batch_pause
+        self.counter = 0
+
+    def wait(self):
+        now = time.monotonic()
+        delta = now - self.last_ts
+        if self.last_ts != 0.0 and delta < self.min_interval:
+            time.sleep(self.min_interval - delta)
+        self.last_ts = time.monotonic()
+        self.counter += 1
+        if self.counter >= self.batch_size:
+            logger.info(f"⏸️  Batch limit reached ({self.batch_size} ops). Pausing for {self.batch_pause}s.")
+            if self.batch_pause > 0:
+                time.sleep(self.batch_pause)
+            self.counter = 0
+
+
+limiter = RateLimiter(MAX_RPS, BATCH_SIZE, BATCH_PAUSE_SEC)
+
+# -------------------------
+# Helper Functions
 # -------------------------
 def connect_panorama() -> Panorama:
     """Connect to Panorama."""
     try:
+        logger.info(f"Connecting to Panorama at {PANORAMA_IP} ...")
         pano = Panorama(hostname=PANORAMA_IP, api_username=USERNAME, api_password=PASSWORD)
         return pano
     except Exception as e:
-        sys.exit(f"❌ ERROR: Failed to connect to Panorama: {e}")
+        logger.error(f"Failed to connect to Panorama: {e}")
+        sys.exit(1)
 
 
 def get_scope_container(pano: Panorama, scope_name: str) -> Union[Panorama, DeviceGroup]:
-    """Return the container for the chosen scope (Shared or DG)."""
+    """Return container for the chosen scope."""
     if scope_name.lower() == "shared":
+        logger.info("Operating in SHARED scope.")
         return pano
 
     dgs = DeviceGroup.refreshall(pano, add=False) or []
@@ -77,20 +154,20 @@ def get_scope_container(pano: Panorama, scope_name: str) -> Union[Panorama, Devi
         if dg.name == scope_name:
             container = DeviceGroup(name=dg.name)
             pano.add(container)
+            logger.info(f"Operating in Device Group: {scope_name}")
             return container
-
     sys.exit(f"❌ ERROR: Device Group '{scope_name}' not found on Panorama.")
 
 
 def load_maps(container: Union[Panorama, DeviceGroup]) -> Tuple[Dict[str, AddressObject], Dict[str, AddressGroup]]:
     """Load all Address Objects & Groups for the scope."""
+    logger.debug(f"Loading address objects/groups from scope: {container}")
     objs = AddressObject.refreshall(container, add=False) or []
     groups = AddressGroup.refreshall(container, add=False) or []
     return ({o.name: o for o in objs}, {g.name: g for g in groups})
 
 
 def find_static_group(container: Union[Panorama, DeviceGroup], name: str) -> Optional[AddressGroup]:
-    """Find a STATIC Address Group by name."""
     groups = AddressGroup.refreshall(container, add=False) or []
     for g in groups:
         if g.name == name:
@@ -98,7 +175,7 @@ def find_static_group(container: Union[Panorama, DeviceGroup], name: str) -> Opt
     return None
 
 
-# ---------- Recursive resolution ----------
+# ---------- Resolution ----------
 def resolve_member_to_object_pairs(
     member_name: str,
     obj_map_local: Dict[str, AddressObject],
@@ -108,7 +185,7 @@ def resolve_member_to_object_pairs(
     member_skips: List[Dict[str, str]],
     seen: Optional[Set[Tuple[str, str]]] = None,
 ) -> Set[Tuple[str, str]]:
-    """Resolve a member name into AddressObject tuples (name, scope)."""
+    """Resolve a member into (object_name, scope) pairs."""
     if seen is None:
         seen = set()
 
@@ -119,6 +196,7 @@ def resolve_member_to_object_pairs(
         identities.append((member_name, 'shared'))
 
     if not identities:
+        logger.warning(f"Member '{member_name}' not found in local/shared.")
         member_skips.append({"member": member_name, "scope": "unknown", "reason": "not found"})
         return set()
 
@@ -126,6 +204,7 @@ def resolve_member_to_object_pairs(
     for name, scope in identities:
         identity = (name, scope)
         if identity in seen:
+            logger.warning(f"Cyclic reference detected on '{name}' ({scope}), skipping.")
             member_skips.append({"member": name, "scope": scope, "reason": "cyclic reference"})
             continue
         seen.add(identity)
@@ -146,34 +225,20 @@ def resolve_member_to_object_pairs(
                     child, obj_map_local, grp_map_local, obj_map_shared, grp_map_shared, member_skips, seen=seen
                 )
         else:
+            logger.info(f"Group '{name}' in {scope} is dynamic/empty, skipping.")
             member_skips.append({"member": name, "scope": scope, "reason": "dynamic/empty group"})
     return results
 
 
-def collect_object_pairs_from_group(
-    group: AddressGroup,
-    obj_map_local: Dict[str, AddressObject],
-    grp_map_local: Dict[str, AddressGroup],
-    obj_map_shared: Dict[str, AddressObject],
-    grp_map_shared: Dict[str, AddressGroup],
-    member_skips: List[Dict[str, str]],
-) -> Set[Tuple[str, str]]:
-    """Expand the target group to all (object, scope) pairs."""
-    pairs: Set[Tuple[str, str]] = set()
-    for member in group.static_value or []:
-        pairs |= resolve_member_to_object_pairs(
-            member, obj_map_local, grp_map_local, obj_map_shared, grp_map_shared, member_skips, seen=set()
-        )
-    return pairs
-
-
-def ensure_tag(container: Union[Panorama, DeviceGroup], tag_name: str) -> Tag:
-    """Ensure the Tag exists in this scope."""
+def ensure_tag(container: Union[Panorama, DeviceGroup], tag_name: str):
     existing = {t.name: t for t in (Tag.refreshall(container, add=False) or [])}
     if tag_name in existing:
+        logger.debug(f"Tag '{tag_name}' already exists in scope {container}.")
         return existing[tag_name]
+    logger.info(f"Creating tag '{tag_name}' in {container}.")
     t = Tag(name=tag_name)
     container.add(t)
+    limiter.wait()
     t.create()
     return t
 
@@ -186,7 +251,6 @@ def tag_objects_by_scope(
     target_group: str,
     target_scope: str
 ) -> Tuple[int, int, List[Dict[str, str]]]:
-    """Tag objects and record detailed results."""
     obj_map_shared, _ = load_maps(pano)
     obj_map_local, _ = ({}, {})
     if local_container:
@@ -199,26 +263,17 @@ def tag_objects_by_scope(
 
     for name, scope in sorted(pairs):
         total += 1
-        if scope == 'shared':
-            obj = obj_map_shared.get(name)
-            container = pano
-        else:
-            if not local_container:
-                outcomes.append({
-                    "object": name, "scope": "local", "status": "not tagged",
-                    "reason": "resolved to local scope but script running in shared mode",
-                    "tag_name": tag_name, "target_group": target_group,
-                    "target_scope": target_scope, "timestamp": timestamp
-                })
-                continue
-            obj = obj_map_local.get(name)
-            container = local_container
+        obj = None
+        container = pano if scope == 'shared' else local_container
+        obj = (obj_map_shared if scope == 'shared' else obj_map_local).get(name)
 
         if not obj:
+            logger.warning(f"Object '{name}' not found in scope {scope}.")
             outcomes.append({
-                "object": name, "scope": scope, "status": "not tagged", "reason": "object not found",
-                "tag_name": tag_name, "target_group": target_group,
-                "target_scope": target_scope, "timestamp": timestamp
+                "object": name, "scope": scope, "status": "not tagged",
+                "reason": "object not found", "tag_name": tag_name,
+                "target_group": target_group, "target_scope": target_scope,
+                "timestamp": timestamp
             })
             continue
 
@@ -228,23 +283,26 @@ def tag_objects_by_scope(
 
         tags = list(obj.tag or [])
         if tag_name in tags:
+            logger.info(f"'{name}' already had tag '{tag_name}' (scope: {scope}).")
             outcomes.append({
                 "object": name, "scope": scope, "status": "not tagged", "reason": "already had tag",
-                "tag_name": tag_name, "target_group": target_group,
-                "target_scope": target_scope, "timestamp": timestamp
+                "tag_name": tag_name, "target_group": target_group, "target_scope": target_scope,
+                "timestamp": timestamp
             })
             continue
 
         tags.append(tag_name)
         obj.tag = tags
+        limiter.wait()
         obj.apply()
         updated += 1
+        logger.info(f"Tagged '{name}' (scope: {scope}).")
+
         outcomes.append({
             "object": name, "scope": scope, "status": "tagged", "reason": "",
             "tag_name": tag_name, "target_group": target_group,
             "target_scope": target_scope, "timestamp": timestamp
         })
-
     return updated, total, outcomes
 
 
@@ -254,69 +312,57 @@ def tag_objects_by_scope(
 def main():
     try:
         pano = connect_panorama()
-        print(f"✅ Connected to Panorama {PANORAMA_IP}")
-
         container = get_scope_container(pano, TARGET_SCOPE)
         scope_label = "Shared" if isinstance(container, Panorama) else f"Device Group '{container.name}'"
-        print(f"📍 Operating scope: {scope_label}")
 
         target_group = find_static_group(container, TARGET_STATIC_GROUP)
         if not target_group:
-            sys.exit(f"❌ ERROR: Address Group '{TARGET_STATIC_GROUP}' not found in {scope_label}.")
+            logger.error(f"Group '{TARGET_STATIC_GROUP}' not found in {scope_label}.")
+            sys.exit(1)
+
         if target_group.static_value is None:
-            sys.exit(f"❌ ERROR: Address Group '{TARGET_STATIC_GROUP}' is not STATIC (it may be dynamic).")
+            logger.error(f"Group '{TARGET_STATIC_GROUP}' is not STATIC.")
+            sys.exit(1)
 
         obj_map_local, grp_map_local = load_maps(container)
         obj_map_shared, grp_map_shared = load_maps(pano) if not isinstance(container, Panorama) else (obj_map_local, grp_map_local)
 
         member_skips: List[Dict[str, str]] = []
-        pairs = collect_object_pairs_from_group(
-            target_group, obj_map_local, grp_map_local, obj_map_shared, grp_map_shared, member_skips
+        pairs = resolve_member_to_object_pairs(
+            TARGET_STATIC_GROUP, obj_map_local, grp_map_local, obj_map_shared, grp_map_shared, member_skips
         )
-
-        if not pairs and not member_skips:
-            sys.exit("❌ ERROR: No valid AddressObjects resolved from the group hierarchy.")
 
         local_container = None if isinstance(container, Panorama) else container
         updated, total, outcomes = tag_objects_by_scope(
             pano, local_container, pairs, DYNAMIC_MATCH_TAG, TARGET_STATIC_GROUP, TARGET_SCOPE
         )
 
-        # Include skipped non-object members in CSV
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Add skipped members to CSV
         for skip in member_skips:
             outcomes.append({
                 "object": skip["member"], "scope": skip["scope"], "status": "not tagged",
                 "reason": skip["reason"], "tag_name": DYNAMIC_MATCH_TAG,
                 "target_group": TARGET_STATIC_GROUP, "target_scope": TARGET_SCOPE,
-                "timestamp": timestamp
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
 
-        # ✅ CSV Output
-        csv_filename = f"panorama_tagging_report_{TARGET_STATIC_GROUP}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        df = pd.DataFrame(outcomes)
-        df.to_csv(csv_filename, index=False)
+        csv_file = f"panorama_tagging_report_{TARGET_STATIC_GROUP}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        pd.DataFrame(outcomes).to_csv(csv_file, index=False)
+        logger.info(f"CSV report saved: {csv_file}")
 
-        # Console summary
-        print("\n==================== Tagging Summary ====================")
-        print(f"Target Group: {TARGET_STATIC_GROUP}")
-        print(f"Scope: {scope_label}")
-        print(f"Tag applied: {DYNAMIC_MATCH_TAG}")
-        print(f"Total objects processed: {total}")
-        print(f"Successfully tagged: {updated}")
-        print(f"Skipped or unchanged: {total - updated}")
-        print("========================================================\n")
-        print(f"📄 CSV report saved as: {csv_filename}")
-        print("⚠️  NOTE: All changes are in Panorama's candidate configuration only.")
-        print("📝  You must COMMIT and PUSH in Panorama to enforce these changes.")
-        print("🎉 Done.")
+        logger.info(f"✅ Tagged {updated}/{total} objects successfully.")
+        logger.info(f"⚙️  Candidate config only. Commit + Push required on Panorama.")
+        logger.info(f"Rate limit: {MAX_RPS} ops/sec, batch={BATCH_SIZE}, pause={BATCH_PAUSE_SEC}s.")
 
     except PanDeviceError as e:
-        sys.exit(f"❌ PAN-OS / Panorama API error: {e}")
+        logger.error(f"PAN-OS API error: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
-        sys.exit("🛑 Aborted by user.")
+        logger.warning("Script aborted by user.")
+        sys.exit(1)
     except Exception as e:
-        sys.exit(f"❌ Unexpected error: {e}")
+        logger.exception(f"Unexpected error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
