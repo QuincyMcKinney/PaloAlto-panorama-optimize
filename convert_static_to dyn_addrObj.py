@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 This script automates the process of tagging static address objects that are in a static address group located in a target Panorama device group.
 It was created to assist with the adoption of Dynamic Address Groups or DAGs.
