@@ -6,6 +6,7 @@ Minimum Software Requirements:
 - Python 3.9.5
 - PAN-OS SDK 1.12.0
 - PAN-OS Software Version: 11.X.X
+- Pandas 2.2.2
 
 This script:
   - Expands a STATIC Address Group (recursively), following nested STATIC groups.
