@@ -1,12 +1,12 @@
 """
 This script automates the process of tagging static address objects that are in a static address group located in a target Panorama device group.
-It was created to assist with the adoption of Dynamic Address Groups or DAGs.
+It was created to assist with the adoption of Dynamic Address Groups.
 
 Minimum Software Requirements:
 - Python 3.9.5
 - PAN-OS SDK 1.12.0
 - PAN-OS Software Version: 11.X.X
-- Pandas 2.2.2
+- Pandas 2.2.1
 
 This script:
   - Expands a STATIC Address Group (recursively), following nested STATIC groups.
@@ -21,8 +21,6 @@ Key points for Network Engineers:
   - "Read" operations use the API to retrieve configuration data; they do NOT change the device configuration.
   - "Write" operations (Tag.create / AddressObject.apply) modify Panorama candidate configuration.
   - Nothing hits dataplane/rules until you "Commit" on Panorama and "Push to devices" from the Panorama GUI or CLI.
-
-Author: Quincy McKinney  
 """
 
 # =========================
