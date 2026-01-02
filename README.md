@@ -4,3 +4,4 @@ Palo Alto Panorama Optimization Tools
 
 This is a collection of Python-based automation and optimization tools designed to help engineers optimize Palo Alto Panorama environments. 
 These tools streamline administrative workflows, reduce manual effort, enforce configuration hygiene, and improve operational visibility.
+For safety reasons, all scripts only make changes to the Candidate Configuration. Commits/Pushes can be done from the CLI or GUI.
