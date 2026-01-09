@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-This is a Palo Alto Panorama hygiene script that disables security rules generated to CSV file from the Policy Optimizer tool.
+This is a Panorama hygiene script that disables security rules. Rules are disabled based off of data generated from the Palo Alto Policy Optimizer tool.
 
 User Guide:
 1. Generate a CSV file from the target Device Group using the Policy Optimizer tool, with headers matching this structre:
