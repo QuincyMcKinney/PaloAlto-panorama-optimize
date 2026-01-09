@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
+
+OVERVIEW:
+
 This is a Panorama hygiene script that disables security rules. Rules are disabled based off of data generated from the Palo Alto Policy Optimizer tool.
+
+FEATURES:
 
 User Guide:
 1. Generate a CSV file from the target Device Group using the Policy Optimizer tool, with headers matching this structre:
@@ -25,6 +30,10 @@ Features:
 - Logs progress to the console and generates a report of the disabled rules a CSV file 
 - Rate limits the number of API writen to the Panorama, this helps prevent overloading the Panorama CPU
 
+Minimum Software Requirements:
+- Python 3.9.5
+- PAN-OS SDK 1.12.0
+- PAN-OS Software Version: 11.X.X
 """
 
 import csv
